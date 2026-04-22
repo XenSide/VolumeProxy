@@ -34,12 +34,126 @@ struct ForegroundHookContext {
     prev_vol: Arc<AtomicU32>,
 }
 
-// Ensure the context is safe to share across MTA threads
 unsafe impl Send for ForegroundHookContext {}
 unsafe impl Sync for ForegroundHookContext {}
 
-// Use a thread-safe RwLock instead of an unsafe raw pointer
 static FOREGROUND_HOOK_CTX: RwLock<Option<Arc<ForegroundHookContext>>> = RwLock::new(None);
+
+// --- Strutture per tracciare le sessioni audio globalmente ---
+
+struct SessionEventTracker {
+    session: IAudioSessionControl,
+    events: IAudioSessionEvents,
+}
+
+unsafe impl Send for SessionEventTracker {}
+unsafe impl Sync for SessionEventTracker {}
+
+impl Drop for SessionEventTracker {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.session.UnregisterAudioSessionNotification(&self.events);
+        }
+    }
+}
+
+static ALL_SESSIONS: RwLock<Option<Vec<SessionEventTracker>>> = RwLock::new(None);
+
+struct SessionManagerNotificationTracker {
+    mgr: IAudioSessionManager2,
+    notification: IAudioSessionNotification,
+}
+
+impl Drop for SessionManagerNotificationTracker {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.mgr.UnregisterSessionNotification(&self.notification);
+        }
+    }
+}
+
+#[implement(IAudioSessionNotification)]
+struct SessionManagerEvents;
+
+impl IAudioSessionNotification_Impl for SessionManagerEvents_Impl {
+    fn OnSessionCreated(&self, new_session: Option<&IAudioSessionControl>) -> Result<()> {
+        let Some(session) = new_session else { return Ok(()) };
+        let Ok(ctrl2) = session.cast::<IAudioSessionControl2>() else { return Ok(()) };
+
+        let events: IAudioSessionEvents = AppSessionEvents { session: ctrl2 }.into();
+
+        if unsafe { session.RegisterAudioSessionNotification(&events) }.is_ok() {
+            if let Ok(mut lock) = ALL_SESSIONS.write() {
+                if let Some(trackers) = lock.as_mut() {
+                    // Previene memory leaks rimuovendo le sessioni morte quando se ne crea una nuova
+                    trackers.retain(|t| {
+                        unsafe { t.session.GetState().unwrap_or(AudioSessionStateExpired) != AudioSessionStateExpired }
+                    });
+                    trackers.push(SessionEventTracker {
+                        session: session.clone(),
+                        events,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[implement(IAudioSessionEvents)]
+struct AppSessionEvents {
+    session: IAudioSessionControl2,
+}
+
+impl IAudioSessionEvents_Impl for AppSessionEvents_Impl {
+    fn OnDisplayNameChanged(&self, _: &PCWSTR, _: *const GUID) -> Result<()> { Ok(()) }
+    fn OnIconPathChanged(&self, _: &PCWSTR, _: *const GUID) -> Result<()> { Ok(()) }
+
+    fn OnSimpleVolumeChanged(
+        &self,
+        new_volume: f32,
+        _new_mute: BOOL,
+        event_context: *const GUID,
+    ) -> Result<()> {
+        // Ignora i cambiamenti da noi causati usando la const OWN_CTX per evitare loop infiniti
+        if !event_context.is_null() && unsafe { *event_context } == OWN_CTX {
+            return Ok(());
+        }
+
+        // Recupera il PID di questa sessione specifica in tempo reale e ignoralo se non è quello in foreground
+        let pid = unsafe { self.session.GetProcessId().unwrap_or(0) };
+        if pid == 0 || pid != foreground_pid() {
+            return Ok(());
+        }
+
+        let ctx = {
+            let guard = match FOREGROUND_HOOK_CTX.read() {
+                Ok(g) => g,
+                Err(_) => return Ok(()),
+            };
+            match guard.as_ref() {
+                Some(c) => c.clone(),
+                None => return Ok(()),
+            }
+        };
+
+        let prev = f32::from_bits(ctx.prev_vol.load(Ordering::Relaxed));
+        if (new_volume - prev).abs() >= 0.001 {
+            // Sincronizza il volume del proxy se il volume dell'app esterna è variato
+            if unsafe { ctx.own_vol.SetMasterVolume(new_volume, &OWN_CTX) }.is_ok() {
+                ctx.prev_vol.store(new_volume.to_bits(), Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    fn OnChannelVolumeChanged(&self, _: u32, _: *const f32, _: u32, _: *const GUID) -> Result<()> { Ok(()) }
+    fn OnGroupingParamChanged(&self, _: *const GUID, _: *const GUID) -> Result<()> { Ok(()) }
+    fn OnStateChanged(&self, _: AudioSessionState) -> Result<()> { Ok(()) }
+    fn OnSessionDisconnected(&self, _reason: AudioSessionDisconnectReason) -> Result<()> { Ok(()) }
+}
+
+// --- FINE NUOVE STRUTTURE ---
 
 static REINIT_NEEDED: AtomicBool = AtomicBool::new(false);
 static mut WAKE_HANDLE: HANDLE = HANDLE(std::ptr::null_mut());
@@ -131,11 +245,10 @@ unsafe extern "system" fn foreground_event_proc(
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     if pid == 0 { return; }
 
-    // Safely acquire the context
     let ctx = {
         let guard = match FOREGROUND_HOOK_CTX.read() {
             Ok(g) => g,
-            Err(_) => return, // Handle poisoned lock
+            Err(_) => return,
         };
         match guard.as_ref() {
             Some(c) => c.clone(),
@@ -176,6 +289,9 @@ fn apply_delta_to_foreground(device: &IMMDevice, delta: f32) -> Option<f32> {
 
 fn run_session(denum: &IMMDeviceEnumerator) -> Result<()> {
     REINIT_NEEDED.store(false, Ordering::Release);
+    if let Ok(mut lock) = ALL_SESSIONS.write() {
+        *lock = None;
+    }
 
     let device: IMMDevice = unsafe { denum.GetDefaultAudioEndpoint(eRender, eConsole)? };
     let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
@@ -196,7 +312,6 @@ fn run_session(denum: &IMMDeviceEnumerator) -> Result<()> {
         match result {
             Ok(()) => break,
             Err(e) if e.code() == AUDCLNT_E_DEVICE_IN_USE => {
-                // Lowered from 30 secs to 2 secs so we are more responsive to reinit requests
                 thread::sleep(std::time::Duration::from_secs(2));
                 if REINIT_NEEDED.load(Ordering::Acquire) { return Ok(()); }
             }
@@ -223,9 +338,37 @@ fn run_session(denum: &IMMDeviceEnumerator) -> Result<()> {
         prev_vol: prev_vol.clone(),
     });
 
-    // Safely assign the context globally
     if let Ok(mut lock) = FOREGROUND_HOOK_CTX.write() {
         *lock = Some(hook_ctx);
+    }
+
+    // Registra ascolto sulle modifiche e creazioni sessioni del sistema 
+    let mgr: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None)? };
+    let session_notification: IAudioSessionNotification = SessionManagerEvents.into();
+    unsafe { mgr.RegisterSessionNotification(&session_notification)? };
+
+    let _mgr_tracker = SessionManagerNotificationTracker {
+        mgr: mgr.clone(),
+        notification: session_notification.clone(),
+    };
+
+    let mut trackers = Vec::new();
+    if let Ok(list) = unsafe { mgr.GetSessionEnumerator() } {
+        if let Ok(n) = unsafe { list.GetCount() } {
+            for i in 0..n {
+                if let Ok(session) = unsafe { list.GetSession(i) } {
+                    if let Ok(ctrl2) = session.cast::<IAudioSessionControl2>() {
+                        let events: IAudioSessionEvents = AppSessionEvents { session: ctrl2 }.into();
+                        if unsafe { session.RegisterAudioSessionNotification(&events) }.is_ok() {
+                            trackers.push(SessionEventTracker { session: session.clone(), events });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(mut lock) = ALL_SESSIONS.write() {
+        *lock = Some(trackers);
     }
 
     let events: IAudioSessionEvents = Proxy {
@@ -248,8 +391,10 @@ fn run_session(denum: &IMMDeviceEnumerator) -> Result<()> {
         let result = unsafe { MsgWaitForMultipleObjects(Some(&[wake]), false, INFINITE, QS_ALLINPUT) };
 
         if REINIT_NEEDED.load(Ordering::Acquire) {
-            // Clean up the foreground hook context safely before we reinit
             if let Ok(mut lock) = FOREGROUND_HOOK_CTX.write() {
+                *lock = None;
+            }
+            if let Ok(mut lock) = ALL_SESSIONS.write() {
                 *lock = None;
             }
             unsafe { WAKE_HANDLE = HANDLE(std::ptr::null_mut()); }
@@ -287,8 +432,6 @@ fn run_session(denum: &IMMDeviceEnumerator) -> Result<()> {
 fn main() -> Result<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
 
-    // FIX: Spawn a dedicated, never-blocking thread specifically for the WinEvent hook.
-    // This ensures Windows never unhooks us due to the main thread blocking/sleeping on startup.
     thread::spawn(|| {
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() };
         let _hook = unsafe {
@@ -300,8 +443,6 @@ fn main() -> Result<()> {
             )
         };
 
-        // Standard message pump for the hook.
-        // GetMessageW returns > 0 on success.
         let mut msg = MSG::default();
         while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
             unsafe { let _ = TranslateMessage(&msg); }
