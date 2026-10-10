@@ -38,6 +38,7 @@ use windows::{
         System::Threading::*,
         UI::Accessibility::*,
         UI::WindowsAndMessaging::*,
+        UI::Shell::PropertiesSystem::PROPERTYKEY,
     },
 };
 
@@ -59,6 +60,8 @@ struct ForegroundHookContext {
     own_vol: ISimpleAudioVolume,
     device: IMMDevice,
     prev_vol: Arc<AtomicU32>,
+    client: IAudioClient,
+    stream_active: Arc<AtomicBool>,
 }
 
 unsafe impl Send for ForegroundHookContext {}
@@ -105,7 +108,7 @@ impl IAudioSessionNotification_Impl for SessionManagerEvents_Impl {
         let Some(session) = new_session else { return Ok(()) };
         let Ok(ctrl2) = session.cast::<IAudioSessionControl2>() else { return Ok(()) };
 
-        let events: IAudioSessionEvents = AppSessionEvents { session: ctrl2 }.into();
+        let events: IAudioSessionEvents = AppSessionEvents { session: ctrl2.clone() }.into();
 
         if unsafe { session.RegisterAudioSessionNotification(&events) }.is_ok() {
             if let Ok(mut lock) = ALL_SESSIONS.write() {
@@ -118,6 +121,14 @@ impl IAudioSessionNotification_Impl for SessionManagerEvents_Impl {
                         events,
                     });
                 }
+            }
+        }
+        
+        let pid = unsafe { ctrl2.GetProcessId().unwrap_or(0) };
+        if pid != 0 && pid == foreground_pid() {
+            let wait_val = WAKE_UP_EVENT_PTR.load(Ordering::Acquire);
+            if wait_val != 0 {
+                unsafe { let _ = SetEvent(HANDLE(wait_val as *mut _)); }
             }
         }
         Ok(())
@@ -176,6 +187,8 @@ impl IAudioSessionEvents_Impl for AppSessionEvents_Impl {
 
 static REINIT_NEEDED: AtomicBool = AtomicBool::new(false);
 static WAKE_HANDLE_PTR: AtomicUsize = AtomicUsize::new(0);
+static WAKE_UP_EVENT_PTR: AtomicUsize = AtomicUsize::new(0);
+static TEARDOWN_REQUEST_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Aggiunto per evitare Leak di risorse di sistema chiudendo correttamente WAKE_HANDLE
 struct EventHandleGuard(HANDLE);
@@ -240,6 +253,43 @@ impl IAudioSessionEvents_Impl for Proxy_Impl {
     }
 }
 
+#[implement(IMMNotificationClient)]
+struct DefaultDeviceTracker;
+
+impl IMMNotificationClient_Impl for DefaultDeviceTracker_Impl {
+    fn OnDeviceStateChanged(&self, _pwstrdeviceid: &PCWSTR, _dwnewstate: DEVICE_STATE) -> Result<()> { Ok(()) }
+    fn OnDeviceAdded(&self, _pwstrdeviceid: &PCWSTR) -> Result<()> { Ok(()) }
+    fn OnDeviceRemoved(&self, _pwstrdeviceid: &PCWSTR) -> Result<()> { Ok(()) }
+    fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _pwstrdefaultdeviceid: &PCWSTR) -> Result<()> {
+        if flow == eRender && role == eConsole {
+            log("Default audio device changed! Requesting session teardown.");
+            REINIT_NEEDED.store(true, Ordering::Release);
+            let handle_val = WAKE_HANDLE_PTR.load(Ordering::Acquire);
+            if handle_val != 0 {
+                unsafe { let _ = SetEvent(HANDLE(handle_val as *mut _)); }
+            }
+            let wait_val = WAKE_UP_EVENT_PTR.load(Ordering::Acquire);
+            if wait_val != 0 {
+                unsafe { let _ = SetEvent(HANDLE(wait_val as *mut _)); }
+            }
+        }
+        Ok(())
+    }
+    fn OnPropertyValueChanged(&self, _pwstrdeviceid: &PCWSTR, _key: &PROPERTYKEY) -> Result<()> { Ok(()) }
+}
+
+struct DeviceNotificationTracker {
+    denum: IMMDeviceEnumerator,
+    client: IMMNotificationClient,
+}
+impl Drop for DeviceNotificationTracker {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.denum.UnregisterEndpointNotificationCallback(&self.client);
+        }
+    }
+}
+
 fn get_volume_for_pid(device: &IMMDevice, pid: u32) -> Option<f32> {
     let mgr: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None).ok()? };
     let list = unsafe { mgr.GetSessionEnumerator().ok()? };
@@ -270,6 +320,25 @@ fn foreground_pid() -> u32 {
     }
 }
 
+fn get_process_name(pid: u32) -> String {
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            let mut buf = [0u16; MAX_PATH as usize];
+            let mut size = buf.len() as u32;
+            let success = QueryFullProcessImageNameW(h, PROCESS_NAME_FORMAT(0), PWSTR(buf.as_mut_ptr()), &mut size);
+            let _ = CloseHandle(h);
+            if success.is_ok() {
+                let name = String::from_utf16_lossy(&buf[..size as usize]);
+                if let Some(idx) = name.rfind('\\') {
+                    return format!("{} (PID: {})", &name[idx + 1..], pid);
+                }
+                return format!("{} (PID: {})", name, pid);
+            }
+        }
+    }
+    format!("PID: {}", pid)
+}
+
 unsafe extern "system" fn foreground_event_proc(
     _hook: HWINEVENTHOOK, event: u32, hwnd: HWND,
     _idobject: i32, _idchild: i32, _dw_event_thread: u32, _dwms_event_time: u32,
@@ -278,7 +347,12 @@ unsafe extern "system" fn foreground_event_proc(
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     if pid == 0 { return; }
-    log(&format!("Foreground window changed. PID: {}", pid));
+    log(&format!("Foreground window changed. {}", get_process_name(pid)));
+
+    let wait_val = WAKE_UP_EVENT_PTR.load(Ordering::Acquire);
+    if wait_val != 0 {
+        unsafe { let _ = SetEvent(HANDLE(wait_val as *mut _)); }
+    }
 
     let ctx = {
         let guard = match FOREGROUND_HOOK_CTX.read() {
@@ -291,11 +365,37 @@ unsafe extern "system" fn foreground_event_proc(
         }
     };
 
+    let mut has_audio = false;
     if let Some(volume) = get_volume_for_pid(&ctx.device, pid) {
+        has_audio = true;
         let prev = f32::from_bits(ctx.prev_vol.load(Ordering::Relaxed));
         if (volume - prev).abs() >= 0.001 {
             if unsafe { ctx.own_vol.SetMasterVolume(volume, &OWN_CTX) }.is_ok() {
                 ctx.prev_vol.store(volume.to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    let currently_active = ctx.stream_active.load(Ordering::Relaxed);
+    if has_audio {
+        TEARDOWN_REQUEST_TIME.store(0, Ordering::Release);
+        if !currently_active {
+            log(&format!("Foreground app {} has audio. Resuming proxy stream.", get_process_name(pid)));
+            unsafe { let _ = ctx.client.Start(); }
+            ctx.stream_active.store(true, Ordering::Relaxed);
+        }
+    } else {
+        if currently_active {
+            log(&format!("Foreground app {} has NO audio. Pausing proxy stream and scheduling teardown in 5s.", get_process_name(pid)));
+            unsafe { let _ = ctx.client.Stop(); }
+            ctx.stream_active.store(false, Ordering::Relaxed);
+            
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            TEARDOWN_REQUEST_TIME.store(now + 5000, Ordering::Release);
+            
+            let handle_val = WAKE_HANDLE_PTR.load(Ordering::Acquire);
+            if handle_val != 0 {
+                unsafe { let _ = SetEvent(HANDLE(handle_val as *mut _)); }
             }
         }
     }
@@ -316,7 +416,7 @@ fn apply_delta_to_foreground(device: &IMMDevice, delta: f32) -> Option<f32> {
         let Ok(cur) = (unsafe { vol.GetMasterVolume() }) else { continue };
         let next = (cur + delta).clamp(0.0, 1.0);
         if unsafe { vol.SetMasterVolume(next, std::ptr::null()) }.is_ok() {
-            log(&format!("Applied volume change (delta: {}) to PID {}", delta, pid));
+            log(&format!("Applied volume change (delta: {}) to {}", delta, get_process_name(pid)));
             result = Some(next);
         }
     }
@@ -334,11 +434,74 @@ fn run_session() -> Result<()> {
         *lock = None;
     }
 
-    // [FIX 1] Spostato CoCreateInstance ALL'INTERNO della funzione. 
-    // Se fallisce all'avvio del sistema, il programma catturerà l'errore e riproverà.
     let denum: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
     let device: IMMDevice = unsafe { denum.GetDefaultAudioEndpoint(eRender, eConsole)? };
     log("Got default audio endpoint.");
+
+    let default_device_tracker: IMMNotificationClient = DefaultDeviceTracker {}.into();
+    unsafe { denum.RegisterEndpointNotificationCallback(&default_device_tracker)? };
+    let _dev_tracker = DeviceNotificationTracker {
+        denum: denum.clone(),
+        client: default_device_tracker,
+    };
+
+    let mgr: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None)? };
+    let session_notification: IAudioSessionNotification = SessionManagerEvents.into();
+    unsafe { mgr.RegisterSessionNotification(&session_notification)? };
+
+    let _mgr_tracker = SessionManagerNotificationTracker {
+        mgr: mgr.clone(),
+        notification: session_notification.clone(),
+    };
+
+    let mut trackers = Vec::new();
+    if let Ok(list) = unsafe { mgr.GetSessionEnumerator() } {
+        if let Ok(n) = unsafe { list.GetCount() } {
+            for i in 0..n {
+                if let Ok(session) = unsafe { list.GetSession(i) } {
+                    if let Ok(ctrl2) = session.cast::<IAudioSessionControl2>() {
+                        let events: IAudioSessionEvents = AppSessionEvents { session: ctrl2.clone() }.into();
+                        if unsafe { session.RegisterAudioSessionNotification(&events) }.is_ok() {
+                            trackers.push(SessionEventTracker { session: session.clone(), events });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(mut lock) = ALL_SESSIONS.write() {
+        *lock = Some(trackers);
+    }
+
+    let wait_event = unsafe { CreateEventW(None, false, false, None)? };
+    WAKE_UP_EVENT_PTR.store(wait_event.0 as usize, Ordering::Release);
+
+    log("Waiting for foreground audio before creating proxy session...");
+    loop {
+        if REINIT_NEEDED.load(Ordering::Acquire) { 
+            WAKE_UP_EVENT_PTR.store(0, Ordering::Release);
+            unsafe { let _ = CloseHandle(wait_event); }
+            return Ok(()); 
+        }
+
+        if get_foreground_volume(&device).is_some() {
+            log("Foreground audio detected! Proceeding to create proxy session.");
+            break;
+        }
+
+        let result = unsafe { MsgWaitForMultipleObjects(Some(&[wait_event]), false, 1000, QS_ALLINPUT) };
+        if result.0 == WAIT_OBJECT_0.0 + 1 {
+            let mut msg = MSG::default();
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe { let _ = TranslateMessage(&msg); }
+                unsafe { DispatchMessageW(&msg); }
+            }
+        }
+    }
+    
+    WAKE_UP_EVENT_PTR.store(0, Ordering::Release);
+    unsafe { let _ = CloseHandle(wait_event); }
+
     let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
 
     let fmt = unsafe { client.GetMixFormat()? };
@@ -372,55 +535,31 @@ fn run_session() -> Result<()> {
     let wake = unsafe { CreateEventW(None, false, false, None)? };
     WAKE_HANDLE_PTR.store(wake.0 as usize, Ordering::Release);
     
-    // [FIX 3] Aggiunto EventHandleGuard per non perdere WAKE_HANDLE ad ogni riconnessione.
     let _wake_guard = EventHandleGuard(wake);
 
     let vol: ISimpleAudioVolume = unsafe { client.GetService()? };
     let ctrl: IAudioSessionControl = unsafe { client.GetService()? };
     unsafe { client.SetEventHandle(wake)? };
 
-    let initial = get_foreground_volume(&device).unwrap_or(0.5);
-    log(&format!("Initial proxy volume set to {}", initial));
-    unsafe { vol.SetMasterVolume(initial, &OWN_CTX)? };
+    let initial = get_foreground_volume(&device);
+    let start_active = initial.is_some();
+    let vol_val = initial.unwrap_or(0.5);
+    log(&format!("Initial proxy volume set to {}", vol_val));
+    unsafe { vol.SetMasterVolume(vol_val, &OWN_CTX)? };
 
-    let prev_vol = Arc::new(AtomicU32::new(initial.to_bits()));
+    let prev_vol = Arc::new(AtomicU32::new(vol_val.to_bits()));
+    let stream_active = Arc::new(AtomicBool::new(start_active));
 
     let hook_ctx = Arc::new(ForegroundHookContext {
         own_vol: vol.clone(),
         device: device.clone(),
         prev_vol: prev_vol.clone(),
+        client: client.clone(),
+        stream_active: stream_active.clone(),
     });
 
     if let Ok(mut lock) = FOREGROUND_HOOK_CTX.write() {
         *lock = Some(hook_ctx);
-    }
-
-    let mgr: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None)? };
-    let session_notification: IAudioSessionNotification = SessionManagerEvents.into();
-    unsafe { mgr.RegisterSessionNotification(&session_notification)? };
-
-    let _mgr_tracker = SessionManagerNotificationTracker {
-        mgr: mgr.clone(),
-        notification: session_notification.clone(),
-    };
-
-    let mut trackers = Vec::new();
-    if let Ok(list) = unsafe { mgr.GetSessionEnumerator() } {
-        if let Ok(n) = unsafe { list.GetCount() } {
-            for i in 0..n {
-                if let Ok(session) = unsafe { list.GetSession(i) } {
-                    if let Ok(ctrl2) = session.cast::<IAudioSessionControl2>() {
-                        let events: IAudioSessionEvents = AppSessionEvents { session: ctrl2 }.into();
-                        if unsafe { session.RegisterAudioSessionNotification(&events) }.is_ok() {
-                            trackers.push(SessionEventTracker { session: session.clone(), events });
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if let Ok(mut lock) = ALL_SESSIONS.write() {
-        *lock = Some(trackers);
     }
 
     let events: IAudioSessionEvents = Proxy {
@@ -446,8 +585,14 @@ fn run_session() -> Result<()> {
         events: events.clone(),
     };
 
-    unsafe { client.Start()? };
-    log("Audio client successfully started and proxy registered.");
+    if start_active {
+        unsafe { client.Start()? };
+        log("Audio client successfully started and proxy registered.");
+    } else {
+        log("Audio client paused (initial foreground has no audio).");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        TEARDOWN_REQUEST_TIME.store(now + 5000, Ordering::Release);
+    }
 
     let render: IAudioRenderClient = unsafe { client.GetService()? };
     let buf_frames = unsafe { client.GetBufferSize()? };
@@ -458,7 +603,20 @@ fn run_session() -> Result<()> {
     }
 
     loop {
-        let result = unsafe { MsgWaitForMultipleObjects(Some(&[wake]), false, INFINITE, QS_ALLINPUT) };
+        let mut timeout = INFINITE;
+        let td_time = TEARDOWN_REQUEST_TIME.load(Ordering::Acquire);
+        if td_time != 0 {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            if now >= td_time {
+                log("Teardown timeout reached. Exiting run_session to clear mixer cache.");
+                REINIT_NEEDED.store(true, Ordering::Release);
+                timeout = 0;
+            } else {
+                timeout = (td_time - now) as u32;
+            }
+        }
+
+        let result = unsafe { MsgWaitForMultipleObjects(Some(&[wake]), false, timeout, QS_ALLINPUT) };
 
         if result == WAIT_FAILED {
             log("MsgWaitForMultipleObjects returned WAIT_FAILED!");
@@ -475,6 +633,19 @@ fn run_session() -> Result<()> {
             }
             // Non azzeriamo WAKE_HANDLE manualmente qui perché lo fa il _wake_guard in automatico 
             return Ok(());
+        }
+
+        if result.0 == WAIT_TIMEOUT.0 {
+            let td_time = TEARDOWN_REQUEST_TIME.load(Ordering::Acquire);
+            if td_time != 0 {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                if now >= td_time {
+                    log("Teardown timeout reached. Exiting run_session to clear mixer cache.");
+                    REINIT_NEEDED.store(true, Ordering::Release);
+                    continue;
+                }
+            }
+            continue;
         }
 
         if result.0 == WAIT_OBJECT_0.0 {
@@ -583,7 +754,20 @@ fn main() -> Result<()> {
     loop {
         match run_session() {
             Ok(()) => {
-                log("run_session exited cleanly. Sleeping 500ms and restarting.");
+                log("run_session exited cleanly. Spawning new instance to clear Windows Volume Mixer cache.");
+                if let Ok(exe) = std::env::current_exe() {
+                    let mut cmd = std::process::Command::new(exe);
+                    if VERBOSE_LOGGING.load(Ordering::Relaxed) {
+                        cmd.arg("--verbose");
+                    }
+                    if cmd.spawn().is_ok() {
+                        std::process::exit(0);
+                    } else {
+                        log("Failed to spawn new process. Falling back to same-process restart.");
+                    }
+                } else {
+                    log("Failed to get current exe path. Falling back to same-process restart.");
+                }
                 thread::sleep(std::time::Duration::from_millis(500));
             }
             Err(e) => {
