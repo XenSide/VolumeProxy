@@ -3,6 +3,12 @@ name = "VolumeProxy"
 version = "0.1.0"
 edition = "2021"
 
+# The binary is named "Foreground" so mixers that fall back to the exe name
+# (e.g. the Stream Deck volume plugin) label the session "Foreground".
+[[bin]]
+name = "Foreground"
+path = "src/main.rs"
+
 [dependencies]
 windows-core = "0.58"
 
