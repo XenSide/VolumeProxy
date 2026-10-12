@@ -681,6 +681,24 @@ fn main() -> Result<()> {
         VERBOSE_LOGGING.store(true, Ordering::Relaxed);
     }
     log("=== VolumeProxy Executable Started ===");
+
+    // Single instance across every copy (Stream Deck plugins, Startup...). Retry briefly:
+    // on a self-respawn the old process still holds the mutex until it exits.
+    let mut _instance = None;
+    for _ in 0..25 {
+        let h = unsafe { CreateMutexW(None, true, w!("Local\\xenside.VolumeProxy.Foreground")) };
+        match h {
+            Ok(h) if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS => { _instance = Some(h); break; }
+            Ok(h) => unsafe { let _ = CloseHandle(h); },
+            Err(_) => {}
+        }
+        thread::sleep(std::time::Duration::from_millis(200));
+    }
+    if _instance.is_none() {
+        log("Another instance is already running. Exiting.");
+        return Ok(());
+    }
+
     unsafe {
         let process = GetCurrentProcess();
         let _ = SetPriorityClass(process, IDLE_PRIORITY_CLASS);
