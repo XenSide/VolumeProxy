@@ -49,6 +49,10 @@ const OWN_CTX: GUID = GUID {
     data4:[0x8C, 0x9D, 0xAE, 0xBF, 0xC0, 0xD1, 0xE2, 0xF3],
 };
 
+fn own_write(event_context: *const GUID) -> bool {
+    !event_context.is_null() && unsafe { *event_context } == OWN_CTX
+}
+
 const SESSION_GUID: GUID = GUID {
     data1: 0xA1B2_C3D4,
     data2: 0xE5F6,
@@ -150,7 +154,7 @@ impl IAudioSessionEvents_Impl for AppSessionEvents_Impl {
         _new_mute: BOOL,
         event_context: *const GUID,
     ) -> Result<()> {
-        if !event_context.is_null() && unsafe { *event_context } == OWN_CTX {
+        if own_write(event_context) {
             return Ok(());
         }
 
@@ -205,7 +209,6 @@ impl Drop for EventHandleGuard {
 
 #[implement(IAudioSessionEvents)]
 struct Proxy {
-    own_vol: ISimpleAudioVolume,
     device: IMMDevice,
     prev_vol: Arc<AtomicU32>,
 }
@@ -220,19 +223,19 @@ impl IAudioSessionEvents_Impl for Proxy_Impl {
         _new_mute: BOOL,
         event_context: *const GUID,
     ) -> Result<()> {
-        if !event_context.is_null() && unsafe { *event_context } == OWN_CTX {
+        if own_write(event_context) {
             return Ok(());
         }
 
         let prev = f32::from_bits(self.prev_vol.load(Ordering::Relaxed));
-        let delta = new_volume - prev;
-        if delta.abs() < 0.001 {
+        if (new_volume - prev).abs() < 0.001 {
             return Ok(());
         }
 
-        let actual = apply_delta_to_foreground(&self.device, delta).unwrap_or(new_volume);
-        let _ = unsafe { self.own_vol.SetMasterVolume(actual, &OWN_CTX) };
-        self.prev_vol.store(actual.to_bits(), Ordering::Relaxed);
+        // Absolute, not a delta: anyone's write (Stream Deck, mixer, AudioDuck) lands on the app as the same value,
+        // so the two sides can't drift or ratchet. OWN_CTX keeps the app's change event from echoing back here.
+        set_foreground_volume(&self.device, new_volume);
+        self.prev_vol.store(new_volume.to_bits(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -401,26 +404,22 @@ unsafe extern "system" fn foreground_event_proc(
     }
 }
 
-fn apply_delta_to_foreground(device: &IMMDevice, delta: f32) -> Option<f32> {
+fn set_foreground_volume(device: &IMMDevice, volume: f32) -> Option<()> {
     let pid = foreground_pid();
     if pid == 0 { return None; }
     let mgr: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None).ok()? };
     let list = unsafe { mgr.GetSessionEnumerator().ok()? };
     let n = unsafe { list.GetCount().ok()? };
-    let mut result = None;
     for i in 0..n {
         let Ok(ctrl) = (unsafe { list.GetSession(i) }) else { continue };
         let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else { continue };
         if unsafe { ctrl2.GetProcessId().unwrap_or(0) } != pid { continue; }
         let Ok(vol) = ctrl.cast::<ISimpleAudioVolume>() else { continue };
-        let Ok(cur) = (unsafe { vol.GetMasterVolume() }) else { continue };
-        let next = (cur + delta).clamp(0.0, 1.0);
-        if unsafe { vol.SetMasterVolume(next, std::ptr::null()) }.is_ok() {
-            log(&format!("Applied volume change (delta: {}) to {}", delta, get_process_name(pid)));
-            result = Some(next);
+        if unsafe { vol.SetMasterVolume(volume, &OWN_CTX) }.is_ok() {
+            log(&format!("Set volume {} on {}", volume, get_process_name(pid)));
         }
     }
-    result
+    Some(())
 }
 
 // Rimosso il passaggio di `denum` tramite argomenti per permetterne il riavvio autonomo
@@ -563,7 +562,6 @@ fn run_session() -> Result<()> {
     }
 
     let events: IAudioSessionEvents = Proxy {
-        own_vol: vol.clone(),
         device: device.clone(),
         prev_vol: prev_vol.clone(),
     }.into();
