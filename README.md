@@ -1,3 +1,5 @@
+![VolumeProxy](docs/cover.png)
+
 # volume-proxy
 
 Makes your volume knob or mixer control whichever app is currently in focus, automatically. Point any controller at `volume-proxy.exe` once, and from that moment turning the knob always affects the foreground app — no manual reassignment needed when switching between a game, a browser, a music player, or anything else. Runs silently in the background with no UI and near-zero resource usage, as it is entirely event-driven and never polls.
